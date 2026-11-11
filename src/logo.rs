@@ -93,6 +93,11 @@ mod tests {
         assert_eq!(icon.width, 32);
         assert_eq!(icon.height, 32);
         assert_eq!(icon.rgba.len(), 32 * 32 * 4);
-        assert!(icon.rgba.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        assert!(icon
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[3] > 0));
     }
 }

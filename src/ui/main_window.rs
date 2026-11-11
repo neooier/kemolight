@@ -1,17 +1,14 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::{Duration, Instant},
-};
+use std::time::Duration;
 
 use eframe::egui::{self, RichText, Slider, ViewportCommand};
 
 use crate::{
     app::{AppCommand, AppController, DisplayState},
     brightness::DisplayId,
+    profiles::ProfileSlot,
 };
 
 const PENDING_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
-const SLIDER_DEBOUNCE: Duration = Duration::from_millis(250);
 const DISPLAY_NAME_WIDTH: f32 = 170.0;
 const PERCENT_WIDTH: f32 = 48.0;
 const SLIDER_WIDTH: f32 = 210.0;
@@ -21,7 +18,14 @@ pub struct MainWindow {
     controller: AppController,
     visible: bool,
     quitting: bool,
-    commits: DebouncedBrightnessCommits,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    startup_setting: Option<StartupSetting>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+struct StartupSetting {
+    enabled: Option<bool>,
+    error: Option<String>,
 }
 
 impl MainWindow {
@@ -30,7 +34,8 @@ impl MainWindow {
             controller,
             visible,
             quitting: false,
-            commits: DebouncedBrightnessCommits::default(),
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            startup_setting: None,
         }
     }
 
@@ -43,41 +48,53 @@ impl MainWindow {
         if self.quitting || !self.controller.tray_available() {
             self.quit(ctx);
         } else {
-            self.hide_to_tray(ctx, true);
+            self.hide_to_tray(ctx);
         }
     }
 
     fn handle_app_commands(&mut self, ctx: &egui::Context) {
+        if self.quitting {
+            return;
+        }
         for command in self.controller.drain_app_commands() {
             match command {
                 AppCommand::OpenWindow => self.show_window(ctx),
-                AppCommand::HideWindow => self.hide_to_tray(ctx, false),
+                AppCommand::HideWindow => self.hide_to_tray(ctx),
                 AppCommand::Quit => self.quit(ctx),
+                #[cfg(target_os = "windows")]
+                AppCommand::UiClosed(_) => {}
+            }
+            if self.quitting {
+                break;
             }
         }
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
+        if !self.visible {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        }
         self.visible = true;
+        #[cfg(target_os = "windows")]
+        self.controller.window_shown();
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
         ctx.request_repaint();
     }
 
-    fn hide_to_tray(&mut self, ctx: &egui::Context, cancel_close: bool) {
+    fn hide_to_tray(&mut self, ctx: &egui::Context) {
         if !self.controller.tray_available() {
             self.quit(ctx);
             return;
         }
 
         self.visible = false;
-        self.commits.clear_active();
+        self.controller.remember_window_geometry(ctx);
 
-        if cancel_close {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-        }
-        ctx.send_viewport_cmd(ViewportCommand::Visible(false));
+        // Return from run_native so the window, renderer, and egui caches can
+        // be dropped. The tray session recreates the UI when it is opened.
+        ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
@@ -86,28 +103,11 @@ impl MainWindow {
         }
 
         self.quitting = true;
-        for (display_id, commit) in self.commits.drain_all() {
-            self.controller
-                .commit_brightness(display_id, commit.value, commit.request_id);
-        }
         self.controller.shutdown();
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
-    fn process_pending_commits(&mut self, now: Instant, ctx: &egui::Context) {
-        for (display_id, commit) in self.commits.drain_ready(now) {
-            self.controller
-                .commit_brightness(display_id, commit.value, commit.request_id);
-            ctx.request_repaint();
-        }
-    }
-
-    fn schedule_repaint(&self, now: Instant, ctx: &egui::Context) {
-        if let Some(delay) = self.commits.next_due(now) {
-            ctx.request_repaint_after(delay.min(SLIDER_DEBOUNCE));
-            return;
-        }
-
+    fn schedule_repaint(&self, ctx: &egui::Context) {
         if self
             .controller
             .snapshot()
@@ -119,26 +119,60 @@ impl MainWindow {
         }
     }
 
-    fn queue_slider_value(&mut self, display_id: DisplayId, value: u32) {
-        let value = value.min(100);
-        let request_id = self
-            .controller
-            .preview_brightness(display_id.clone(), value);
-        self.commits.queue(
-            display_id,
-            value,
-            request_id,
-            Instant::now(),
-            SLIDER_DEBOUNCE,
-        );
-    }
-
     fn render_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("Refresh").clicked() {
                 self.controller.refresh();
                 ui.ctx().request_repaint();
             }
+
+            ui.menu_button("Profiles", |ui| {
+                let snapshot = self.controller.snapshot();
+                ui.set_min_width(270.0);
+                for slot in ProfileSlot::ALL {
+                    ui.strong(slot.label());
+                    let saved = snapshot.profiles.get(slot);
+                    if saved.is_empty() {
+                        ui.weak("No brightness saved yet");
+                    } else {
+                        for entry in saved.values() {
+                            ui.label(format!("{}: {}%", entry.name, entry.brightness));
+                        }
+                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                self.controller.can_save_profile(),
+                                egui::Button::new("Save current"),
+                            )
+                            .clicked()
+                        {
+                            self.controller.save_profile(slot);
+                            ui.close();
+                        }
+                        let label = if cfg!(target_os = "windows") {
+                            format!("Apply ({})", slot.shortcut())
+                        } else {
+                            "Apply".into()
+                        };
+                        if ui
+                            .add_enabled(
+                                self.controller.can_apply_profile(slot),
+                                egui::Button::new(label),
+                            )
+                            .clicked()
+                        {
+                            self.controller.apply_profile(slot);
+                            ui.close();
+                        }
+                    });
+                    ui.separator();
+                }
+                ui.weak("Saves each connected display separately.");
+            });
+
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            self.render_settings_menu(ui);
 
             let hide_label = if self.controller.tray_available() {
                 "Hide to Tray"
@@ -147,7 +181,7 @@ impl MainWindow {
             };
             if ui.button(hide_label).clicked() {
                 if self.controller.tray_available() {
-                    self.hide_to_tray(ui.ctx(), false);
+                    self.hide_to_tray(ui.ctx());
                 } else {
                     self.quit(ui.ctx());
                 }
@@ -157,6 +191,55 @@ impl MainWindow {
                 self.quit(ui.ctx());
             }
         });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn render_settings_menu(&mut self, ui: &mut egui::Ui) {
+        let config = egui::menu::MenuConfig::new()
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        let (_, menu) = egui::menu::MenuButton::new("Settings")
+            .config(config)
+            .ui(ui, |ui| {
+                let setting = self.startup_setting.get_or_insert_with(|| {
+                    match crate::startup::is_enabled() {
+                        Ok(enabled) => StartupSetting {
+                            enabled: Some(enabled),
+                            error: None,
+                        },
+                        Err(error) => StartupSetting {
+                            enabled: None,
+                            error: Some(format!("Could not read startup setting: {error}")),
+                        },
+                    }
+                });
+
+                let mut checked = setting.enabled.unwrap_or_default();
+                if ui
+                    .add_enabled(
+                        setting.enabled.is_some(),
+                        egui::Checkbox::new(&mut checked, "Start at sign-in"),
+                    )
+                    .changed()
+                {
+                    match crate::startup::set_enabled(checked) {
+                        Ok(()) => {
+                            setting.enabled = Some(checked);
+                            setting.error = None;
+                        }
+                        Err(error) => {
+                            setting.error =
+                                Some(format!("Could not change startup setting: {error}"));
+                        }
+                    }
+                }
+
+                if let Some(error) = &setting.error {
+                    ui.small(RichText::new(error).color(ui.visuals().error_fg_color));
+                }
+            });
+        if menu.is_none() {
+            self.startup_setting = None;
+        }
     }
 
     fn render_display_row(&mut self, ui: &mut egui::Ui, display: DisplayState) {
@@ -192,20 +275,7 @@ impl MainWindow {
             ui.add_sized([PERCENT_WIDTH, 20.0], egui::Label::new(percent));
 
             ui.scope(|ui| {
-                ui.spacing_mut().slider_width = SLIDER_WIDTH;
-                let response =
-                    ui.add_enabled(enabled, Slider::new(&mut value, 0..=100).show_value(false));
-
-                if response.drag_started() {
-                    self.commits.mark_active(display_id.clone());
-                }
-                if response.changed() {
-                    self.queue_slider_value(display_id.clone(), value);
-                }
-                if response.drag_stopped() {
-                    self.commits
-                        .mark_inactive(&display_id, Instant::now(), SLIDER_DEBOUNCE);
-                }
+                self.render_brightness_slider(ui, &display_id, &mut value, enabled);
             });
 
             if step_button(ui, enabled, "−").clicked() {
@@ -232,6 +302,22 @@ impl MainWindow {
             ui.small(RichText::new(error).color(ui.visuals().error_fg_color));
         }
     }
+
+    fn render_brightness_slider(
+        &self,
+        ui: &mut egui::Ui,
+        display_id: &DisplayId,
+        value: &mut u32,
+        enabled: bool,
+    ) -> egui::Response {
+        ui.spacing_mut().slider_width = SLIDER_WIDTH;
+        let response = ui.add_enabled(enabled, Slider::new(value, 0..=100).show_value(false));
+        if response.changed() {
+            self.controller.set_brightness(display_id.clone(), *value);
+            ui.ctx().request_repaint();
+        }
+        response
+    }
 }
 
 fn step_button(ui: &mut egui::Ui, enabled: bool, label: &'static str) -> egui::Response {
@@ -253,12 +339,7 @@ impl eframe::App for MainWindow {
             ctx.request_repaint();
         }
 
-        let now = Instant::now();
-        if !ctx.input(|input| input.pointer.primary_down()) {
-            self.commits.release_active(now, SLIDER_DEBOUNCE);
-        }
-        self.process_pending_commits(now, ctx);
-        self.schedule_repaint(now, ctx);
+        self.schedule_repaint(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -269,6 +350,15 @@ impl eframe::App for MainWindow {
             ui.separator();
 
             let snapshot = self.controller.snapshot();
+            if let Some(message) = &snapshot.profile_message {
+                ui.small(message);
+            }
+            for error in [&snapshot.profile_error, &snapshot.hotkey_error]
+                .into_iter()
+                .flatten()
+            {
+                ui.small(RichText::new(error).color(ui.visuals().error_fg_color));
+            }
             if let Some(error) = snapshot.last_error {
                 ui.small(RichText::new(error).color(ui.visuals().error_fg_color));
                 ui.separator();
@@ -293,164 +383,135 @@ impl eframe::App for MainWindow {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PendingBrightnessCommit {
-    value: u32,
-    request_id: u64,
-    due_at: Instant,
-}
-
-#[derive(Default)]
-struct DebouncedBrightnessCommits {
-    pending: HashMap<DisplayId, PendingBrightnessCommit>,
-    active: HashSet<DisplayId>,
-}
-
-impl DebouncedBrightnessCommits {
-    fn queue(
-        &mut self,
-        display_id: DisplayId,
-        value: u32,
-        request_id: u64,
-        now: Instant,
-        debounce: Duration,
-    ) {
-        self.pending.insert(
-            display_id,
-            PendingBrightnessCommit {
-                value: value.min(100),
-                request_id,
-                due_at: now + debounce,
-            },
-        );
-    }
-
-    fn mark_active(&mut self, display_id: DisplayId) {
-        self.active.insert(display_id);
-    }
-
-    fn mark_inactive(&mut self, display_id: &DisplayId, now: Instant, debounce: Duration) {
-        self.active.remove(display_id);
-        if let Some(commit) = self.pending.get_mut(display_id) {
-            commit.due_at = now + debounce;
-        }
-    }
-
-    fn release_active(&mut self, now: Instant, debounce: Duration) {
-        for display_id in self.active.drain() {
-            if let Some(commit) = self.pending.get_mut(&display_id) {
-                commit.due_at = now + debounce;
-            }
-        }
-    }
-
-    fn clear_active(&mut self) {
-        self.active.clear();
-    }
-
-    fn drain_ready(&mut self, now: Instant) -> Vec<(DisplayId, PendingBrightnessCommit)> {
-        let ready = self
-            .pending
-            .iter()
-            .filter_map(|(display_id, commit)| {
-                if commit.due_at <= now && !self.active.contains(display_id) {
-                    Some(display_id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-
-        ready
-            .into_iter()
-            .filter_map(|display_id| {
-                self.pending
-                    .remove(&display_id)
-                    .map(|commit| (display_id, commit))
-            })
-            .collect()
-    }
-
-    fn drain_all(&mut self) -> Vec<(DisplayId, PendingBrightnessCommit)> {
-        self.active.clear();
-        self.pending.drain().collect()
-    }
-
-    fn next_due(&self, now: Instant) -> Option<Duration> {
-        self.pending
-            .iter()
-            .filter(|(display_id, _)| !self.active.contains(*display_id))
-            .map(|(_, commit)| commit.due_at.saturating_duration_since(now))
-            .min()
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, feature = "mock-backend"))]
 mod tests {
     use super::*;
+    use crate::{
+        brightness::{mock::MockBrightnessBackend, BrightnessBackend},
+        config::AppConfig,
+    };
+    use std::{sync::Arc, time::Instant};
+
+    fn wait_for(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !condition() {
+            assert!(Instant::now() < deadline, "brightness update timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 
     #[test]
-    fn debounce_keeps_only_last_pending_value() {
-        let mut commits = DebouncedBrightnessCommits::default();
-        let display_id = DisplayId::new("display-1");
-        let now = Instant::now();
+    fn hide_releases_viewport_and_keeps_brightness_control_running() {
+        let backend = Arc::new(MockBrightnessBackend::default());
+        let controller = AppController::with_backend(AppConfig::default(), backend.clone());
+        controller.set_tray_available(true);
+        wait_for(|| !controller.snapshot().displays.is_empty());
+        let mut window = MainWindow::new(controller.clone(), true);
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            window.hide_to_tray(ui.ctx());
+        });
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, ViewportCommand::Close)));
+        assert!(!commands
+            .iter()
+            .any(|command| matches!(command, ViewportCommand::CancelClose)));
+        assert!(!controller.is_quitting());
 
-        commits.queue(display_id.clone(), 25, 1, now, SLIDER_DEBOUNCE);
-        commits.queue(
-            display_id.clone(),
-            75,
-            2,
-            now + Duration::from_millis(50),
-            SLIDER_DEBOUNCE,
+        let display_id = DisplayId::new("mock:internal");
+        controller.set_brightness(display_id.clone(), 42);
+        wait_for(|| backend.get_brightness(&display_id).unwrap().percent() == 42);
+        controller.shutdown();
+    }
+
+    #[test]
+    fn open_cancels_a_hide_requested_in_the_same_frame() {
+        let controller = AppController::with_backend(
+            AppConfig::default(),
+            Arc::new(MockBrightnessBackend::default()),
         );
-
-        assert!(commits
-            .drain_ready(now + Duration::from_millis(249))
-            .is_empty());
-
-        let ready = commits.drain_ready(now + Duration::from_millis(301));
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].0, display_id);
-        assert_eq!(ready[0].1.value, 75);
-        assert_eq!(ready[0].1.request_id, 2);
+        controller.set_tray_available(true);
+        let mut window = MainWindow::new(controller.clone(), true);
+        let context = egui::Context::default();
+        let output = context.run_ui(egui::RawInput::default(), |ui| {
+            window.hide_to_tray(ui.ctx());
+            controller.request_open_window();
+            window.handle_app_commands(ui.ctx());
+        });
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(commands
+            .iter()
+            .any(|command| matches!(command, ViewportCommand::CancelClose)));
+        assert!(window.visible);
+        assert!(!controller.is_quitting());
+        controller.shutdown();
     }
 
     #[test]
-    fn active_drag_does_not_commit_until_released() {
-        let mut commits = DebouncedBrightnessCommits::default();
-        let display_id = DisplayId::new("display-1");
-        let now = Instant::now();
+    fn slider_changes_hardware_while_pointer_is_still_down() {
+        let backend = Arc::new(MockBrightnessBackend::default());
+        let controller = AppController::with_backend(AppConfig::default(), backend.clone());
+        wait_for(|| !controller.snapshot().displays.is_empty());
+        let window = MainWindow::new(controller.clone(), true);
+        let context = egui::Context::default();
+        let display_id = DisplayId::new("mock:internal");
+        let mut value = 60;
+        let mut slider_rect = egui::Rect::NOTHING;
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                slider_rect = window
+                    .render_brightness_slider(ui, &display_id, &mut value, true)
+                    .rect;
+            });
+        });
+        let position = egui::pos2(
+            slider_rect.left() + slider_rect.width() * 0.25,
+            slider_rect.center().y,
+        );
+        let input = egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        let _ = context.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                window.render_brightness_slider(ui, &display_id, &mut value, true);
+            });
+        });
 
-        commits.mark_active(display_id.clone());
-        commits.queue(display_id.clone(), 10, 1, now, SLIDER_DEBOUNCE);
-        assert!(commits
-            .drain_ready(now + Duration::from_millis(500))
-            .is_empty());
+        assert!(context.input(|input| input.pointer.primary_down()));
+        assert_ne!(value, 60);
+        wait_for(|| backend.get_brightness(&display_id).unwrap().percent() == value);
+        assert!(context.input(|input| input.pointer.primary_down()));
 
-        let release_at = now + Duration::from_millis(500);
-        commits.mark_inactive(&display_id, release_at, SLIDER_DEBOUNCE);
-        assert!(commits
-            .drain_ready(release_at + Duration::from_millis(249))
-            .is_empty());
-
-        let ready = commits.drain_ready(release_at + Duration::from_millis(251));
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].1.value, 10);
-    }
-
-    #[test]
-    fn release_active_unblocks_pending_commit() {
-        let mut commits = DebouncedBrightnessCommits::default();
-        let display_id = DisplayId::new("display-1");
-        let now = Instant::now();
-
-        commits.mark_active(display_id.clone());
-        commits.queue(display_id.clone(), 40, 1, now, SLIDER_DEBOUNCE);
-        commits.release_active(now + Duration::from_millis(300), SLIDER_DEBOUNCE);
-
-        let ready = commits.drain_ready(now + Duration::from_millis(551));
-        assert_eq!(ready.len(), 1);
-        assert_eq!(ready[0].0, display_id);
-        assert_eq!(ready[0].1.value, 40);
+        let previous = value;
+        let drag_position = egui::pos2(
+            slider_rect.left() + slider_rect.width() * 0.75,
+            slider_rect.center().y,
+        );
+        let _ = context.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::PointerMoved(drag_position)],
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    window.render_brightness_slider(ui, &display_id, &mut value, true);
+                });
+            },
+        );
+        assert!(value > previous);
+        wait_for(|| backend.get_brightness(&display_id).unwrap().percent() == value);
+        assert!(context.input(|input| input.pointer.primary_down()));
+        controller.shutdown();
     }
 }

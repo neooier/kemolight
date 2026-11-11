@@ -1,4 +1,4 @@
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{SyncSender, TrySendError};
 
 use crate::app::AppController;
 
@@ -10,7 +10,7 @@ pub mod windows;
 
 pub struct TrayHandle {
     available: bool,
-    update_tx: Option<Sender<()>>,
+    update_tx: Option<SyncSender<()>>,
     shutdown: Option<Box<dyn FnOnce()>>,
 }
 
@@ -23,10 +23,10 @@ impl TrayHandle {
         }
     }
 
-    pub fn available(update_tx: Sender<()>, shutdown: impl FnOnce() + 'static) -> Self {
+    pub fn available(update_tx: Option<SyncSender<()>>, shutdown: impl FnOnce() + 'static) -> Self {
         Self {
             available: true,
-            update_tx: Some(update_tx),
+            update_tx,
             shutdown: Some(Box::new(shutdown)),
         }
     }
@@ -35,14 +35,14 @@ impl TrayHandle {
         self.available
     }
 
-    pub fn update_sender(&self) -> Option<Sender<()>> {
+    pub fn update_sender(&self) -> Option<SyncSender<()>> {
         self.update_tx.clone()
     }
 
     pub fn request_update(&self) -> bool {
-        self.update_tx
-            .as_ref()
-            .is_some_and(|update_tx| update_tx.send(()).is_ok())
+        self.update_tx.as_ref().is_some_and(|update_tx| {
+            matches!(update_tx.try_send(()), Ok(()) | Err(TrySendError::Full(())))
+        })
     }
 }
 
@@ -51,32 +51,6 @@ impl Drop for TrayHandle {
         if let Some(shutdown) = self.shutdown.take() {
             shutdown();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::mpsc;
-
-    #[test]
-    fn unavailable_tray_update_is_noop() {
-        let handle = TrayHandle::unavailable();
-
-        assert!(!handle.is_available());
-        assert!(handle.update_sender().is_none());
-        assert!(!handle.request_update());
-    }
-
-    #[test]
-    fn available_tray_update_sends_event() {
-        let (tx, rx) = mpsc::channel();
-        let handle = TrayHandle::available(tx, || {});
-
-        assert!(handle.is_available());
-        assert!(handle.update_sender().is_some());
-        assert!(handle.request_update());
-        assert!(rx.try_recv().is_ok());
     }
 }
 
@@ -97,5 +71,38 @@ pub fn start_tray(controller: AppController) -> TrayHandle {
     )))]
     {
         mock::start_tray(controller)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    #[test]
+    fn unavailable_tray_update_is_noop() {
+        let handle = TrayHandle::unavailable();
+
+        assert!(!handle.is_available());
+        assert!(handle.update_sender().is_none());
+        assert!(!handle.request_update());
+    }
+
+    #[test]
+    fn available_tray_update_sends_event() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let handle = TrayHandle::available(Some(tx), || {});
+
+        assert!(handle.is_available());
+        assert!(handle.update_sender().is_some());
+        assert!(handle.request_update());
+        for _ in 0..10_000 {
+            assert!(handle.request_update());
+        }
+        assert_eq!(rx.try_iter().count(), 1);
+        assert!(handle.request_update());
+        assert!(rx.try_recv().is_ok());
+        drop(rx);
+        assert!(!handle.request_update());
     }
 }

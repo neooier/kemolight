@@ -1,5 +1,6 @@
 use std::{fmt, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::PreferredBackend;
@@ -13,7 +14,7 @@ pub mod mock;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DisplayId(String);
 
 impl DisplayId {
@@ -32,7 +33,7 @@ impl fmt::Display for DisplayId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DisplayKind {
     InternalBacklight,
     ExternalDdcCi,
@@ -49,7 +50,7 @@ impl DisplayKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisplayInfo {
     pub id: DisplayId,
     pub name: String,

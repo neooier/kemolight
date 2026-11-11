@@ -4,6 +4,12 @@ use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub(crate) const START_HIDDEN_ARGUMENT: &str = "--start-hidden";
+
+pub(crate) fn start_hidden_requested() -> bool {
+    std::env::args_os().nth(1).as_deref() == Some(START_HIDDEN_ARGUMENT.as_ref())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PreferredBackend {

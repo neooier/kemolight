@@ -6,10 +6,8 @@ use windows_sys::{
     core::BOOL,
     Win32::{
         Devices::Display::{
-            DestroyPhysicalMonitor, DestroyPhysicalMonitors, GetMonitorBrightness,
-            GetMonitorCapabilities, GetNumberOfPhysicalMonitorsFromHMONITOR,
-            GetPhysicalMonitorsFromHMONITOR, SetMonitorBrightness, MC_CAPS_BRIGHTNESS,
-            PHYSICAL_MONITOR,
+            DestroyPhysicalMonitor, GetMonitorBrightness, GetNumberOfPhysicalMonitorsFromHMONITOR,
+            GetPhysicalMonitorsFromHMONITOR, SetMonitorBrightness, PHYSICAL_MONITOR,
         },
         Foundation::{HANDLE, LPARAM, RECT},
         Graphics::Gdi::{
@@ -60,9 +58,9 @@ impl BrightnessBackend for WindowsBrightnessBackend {
                 continue;
             }
 
-            let brightness = monitor.get_brightness();
-            let supports_brightness = monitor.supports_brightness() || brightness.is_ok();
-            let current = brightness.ok().map(|value| value.percent());
+            // A successful read already establishes brightness support. Querying
+            // all capabilities can take seconds even on readable monitors.
+            let current = monitor.get_brightness().ok().map(|value| value.percent());
 
             displays.push(DisplayInfo {
                 id: monitor.id(),
@@ -70,7 +68,7 @@ impl BrightnessBackend for WindowsBrightnessBackend {
                 kind: DisplayKind::ExternalDdcCi,
                 current,
                 max: 100,
-                supported: supports_brightness && current.is_some(),
+                supported: current.is_some(),
             });
         }
 
@@ -125,11 +123,11 @@ fn wmi_display_hardware_ids(displays: &[DisplayInfo]) -> Vec<String> {
 }
 
 fn wmi_get_brightness(display_id: &DisplayId) -> Result<BrightnessValue> {
-    let index = wmi_display_index(display_id)?;
+    let instance = wmi_instance_name(display_id)?.replace('\'', "''");
     let script = format!(
-        r#"$items = @(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop | Where-Object {{ $_.Active }})
-if ({index} -ge $items.Count) {{ exit 2 }}
-$items[{index}].CurrentBrightness"#
+        r#"$items = @(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop | Where-Object {{ $_.Active -and $_.InstanceName -eq '{instance}' }})
+if ($items.Count -eq 0) {{ exit 2 }}
+$items[0].CurrentBrightness"#
     );
     let output = powershell_output(&script)?;
     let current = output
@@ -146,13 +144,13 @@ $items[{index}].CurrentBrightness"#
 }
 
 fn wmi_set_brightness(display_id: &DisplayId, value: u32) -> Result<()> {
-    let index = wmi_display_index(display_id)?;
+    let instance = wmi_instance_name(display_id)?.replace('\'', "''");
     let value = clamp_percent(value);
     let script = format!(
         r#"$brightness = {value}
-$brightnessItems = @(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop | Where-Object {{ $_.Active }})
-if ({index} -ge $brightnessItems.Count) {{ exit 2 }}
-$instanceName = $brightnessItems[{index}].InstanceName
+$brightnessItems = @(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop | Where-Object {{ $_.Active -and $_.InstanceName -eq '{instance}' }})
+if ($brightnessItems.Count -eq 0) {{ exit 2 }}
+$instanceName = $brightnessItems[0].InstanceName
 $methodItems = @(Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop | Where-Object {{ $_.InstanceName -eq $instanceName }})
 if ($methodItems.Count -eq 0) {{ exit 3 }}
 Invoke-CimMethod -InputObject $methodItems[0] -MethodName WmiSetBrightness -Arguments @{{ Timeout = 1; Brightness = $brightness }} | Out-Null"#
@@ -160,11 +158,11 @@ Invoke-CimMethod -InputObject $methodItems[0] -MethodName WmiSetBrightness -Argu
     powershell_output(&script).map(|_| ())
 }
 
-fn wmi_display_index(display_id: &DisplayId) -> Result<usize> {
+fn wmi_instance_name(display_id: &DisplayId) -> Result<&str> {
     display_id
         .as_str()
         .strip_prefix(WMI_ID_PREFIX)
-        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| hardware_id_from_device_instance(value).is_some())
         .ok_or_else(|| BrightnessError::DisplayNotFound(display_id.clone()))
 }
 
@@ -210,8 +208,14 @@ fn parse_wmi_list(output: &str) -> Vec<DisplayInfo> {
             let index = parts.next()?.parse::<usize>().ok()?;
             let current = parts.next()?.parse::<u32>().ok().map(clamp_percent);
             let instance_name = parts.next().unwrap_or_default().trim();
+            if instance_name.is_empty() {
+                return None;
+            }
             Some(DisplayInfo {
-                id: DisplayId::new(format!("{WMI_ID_PREFIX}{index}")),
+                id: DisplayId::new(format!(
+                    "{WMI_ID_PREFIX}{}",
+                    instance_name.to_ascii_uppercase()
+                )),
                 name: wmi_display_name(index, instance_name),
                 kind: DisplayKind::InternalBacklight,
                 current,
@@ -260,45 +264,24 @@ struct MonitorAddress {
     physical_index: usize,
 }
 
-impl MonitorAddress {
-    fn id(self) -> DisplayId {
-        DisplayId::new(format!(
-            "{ID_PREFIX}{}:{}",
-            self.logical_index, self.physical_index
-        ))
-    }
-
-    fn parse(display_id: &DisplayId) -> Result<Self> {
-        let Some(value) = display_id.as_str().strip_prefix(ID_PREFIX) else {
-            return Err(BrightnessError::DisplayNotFound(display_id.clone()));
-        };
-        let Some((logical, physical)) = value.split_once(':') else {
-            return Err(BrightnessError::DisplayNotFound(display_id.clone()));
-        };
-        let logical_index = logical
-            .parse()
-            .map_err(|_| BrightnessError::DisplayNotFound(display_id.clone()))?;
-        let physical_index = physical
-            .parse()
-            .map_err(|_| BrightnessError::DisplayNotFound(display_id.clone()))?;
-
-        Ok(Self {
-            logical_index,
-            physical_index,
-        })
-    }
-}
-
 struct PhysicalMonitor {
     address: MonitorAddress,
     handle: HANDLE,
     description: String,
     hardware_id: Option<String>,
+    device_instance: Option<String>,
 }
 
 impl PhysicalMonitor {
     fn id(&self) -> DisplayId {
-        self.address.id()
+        let device = self
+            .device_instance
+            .clone()
+            .unwrap_or_else(|| format!("temporary:{}", self.address.logical_index));
+        DisplayId::new(format!(
+            "{ID_PREFIX}{device}:{}",
+            self.address.physical_index
+        ))
     }
 
     fn name(&self) -> String {
@@ -326,15 +309,6 @@ impl PhysicalMonitor {
         hardware_ids
             .iter()
             .any(|id| !id.is_empty() && description.contains(id))
-    }
-
-    fn supports_brightness(&self) -> bool {
-        let mut capabilities = 0;
-        let mut color_temperatures = 0;
-        unsafe {
-            GetMonitorCapabilities(self.handle, &mut capabilities, &mut color_temperatures) != 0
-                && (capabilities & MC_CAPS_BRIGHTNESS) != 0
-        }
     }
 
     fn get_brightness(&self) -> Result<BrightnessValue> {
@@ -405,29 +379,31 @@ impl PhysicalMonitorArray {
             });
         }
 
-        let mut monitors = vec![PHYSICAL_MONITOR::default(); count as usize];
-        let ok = unsafe { GetPhysicalMonitorsFromHMONITOR(hmonitor, count, monitors.as_mut_ptr()) };
+        let mut array = Self {
+            monitors: vec![PHYSICAL_MONITOR::default(); count as usize],
+        };
+        let ok = unsafe {
+            GetPhysicalMonitorsFromHMONITOR(hmonitor, count, array.monitors.as_mut_ptr())
+        };
         if ok == 0 {
             return Err(ddcci_error("failed to get physical monitors"));
         }
 
-        Ok(Self { monitors })
+        Ok(array)
     }
 }
 
 impl Drop for PhysicalMonitorArray {
     fn drop(&mut self) {
-        if self.monitors.is_empty() {
-            return;
-        }
-
-        unsafe {
-            DestroyPhysicalMonitors(self.monitors.len() as u32, self.monitors.as_ptr());
+        for monitor in &self.monitors {
+            if !monitor.hPhysicalMonitor.is_null() {
+                unsafe { DestroyPhysicalMonitor(monitor.hPhysicalMonitor) };
+            }
         }
     }
 }
 
-fn enumerate_physical_monitors() -> Result<Vec<PhysicalMonitor>> {
+fn enumerate_logical_monitors() -> Result<Vec<HMONITOR>> {
     let mut hmonitors = Vec::new();
     let ok = unsafe {
         EnumDisplayMonitors(
@@ -440,24 +416,36 @@ fn enumerate_physical_monitors() -> Result<Vec<PhysicalMonitor>> {
     if ok == 0 {
         return Err(ddcci_error("failed to enumerate display monitors"));
     }
+    Ok(hmonitors)
+}
 
+fn enumerate_physical_monitors() -> Result<Vec<PhysicalMonitor>> {
     let mut monitors = Vec::new();
-    for (logical_index, hmonitor) in hmonitors.into_iter().enumerate() {
-        let hardware_id = monitor_hardware_id(hmonitor);
-        let physical_monitors = PhysicalMonitorArray::from_hmonitor(hmonitor)?;
-        for (physical_index, physical_monitor) in physical_monitors.monitors.iter().enumerate() {
+    for (logical_index, hmonitor) in enumerate_logical_monitors()?.into_iter().enumerate() {
+        let device_instance = monitor_device_instance(hmonitor);
+        let hardware_id = device_instance.as_ref().and_then(|instance| {
+            hardware_id_from_device_instance(
+                &instance.trim_start_matches(r"\\?\").replace('#', "\\"),
+            )
+        });
+        let mut physical_monitors = PhysicalMonitorArray::from_hmonitor(hmonitor)?;
+        for (physical_index, physical_monitor) in physical_monitors.monitors.iter_mut().enumerate()
+        {
             let description = physical_monitor.szPhysicalMonitorDescription;
-            monitors.push(PhysicalMonitor {
+            let monitor = PhysicalMonitor {
                 address: MonitorAddress {
                     logical_index,
                     physical_index,
                 },
-                handle: physical_monitor.hPhysicalMonitor,
                 description: wide_to_string(&description),
                 hardware_id: hardware_id.clone(),
-            });
+                device_instance: device_instance.clone(),
+                handle: physical_monitor.hPhysicalMonitor,
+            };
+            // The individual monitor now owns this handle. The array still owns its buffer.
+            physical_monitor.hPhysicalMonitor = ptr::null_mut();
+            monitors.push(monitor);
         }
-        mem::forget(physical_monitors);
     }
 
     Ok(monitors)
@@ -474,7 +462,11 @@ unsafe extern "system" fn enum_monitor(
     1
 }
 
-fn monitor_hardware_id(hmonitor: HMONITOR) -> Option<String> {
+fn monitor_device_instance(hmonitor: HMONITOR) -> Option<String> {
+    monitor_device_path(hmonitor, false)
+}
+
+fn monitor_device_path(hmonitor: HMONITOR, require_unique: bool) -> Option<String> {
     let mut monitor_info = MONITORINFOEXW::default();
     monitor_info.monitorInfo.cbSize = mem::size_of::<MONITORINFOEXW>() as u32;
 
@@ -487,19 +479,62 @@ fn monitor_hardware_id(hmonitor: HMONITOR) -> Option<String> {
         cb: mem::size_of::<DISPLAY_DEVICEW>() as u32,
         ..Default::default()
     };
-    let ok = unsafe { EnumDisplayDevicesW(monitor_info.szDevice.as_ptr(), 0, &mut device, 0) };
+    // EDD_GET_DEVICE_INTERFACE_NAME identifies this monitor independently of
+    // the current logical display enumeration order.
+    let ok = unsafe { EnumDisplayDevicesW(monitor_info.szDevice.as_ptr(), 0, &mut device, 1) };
     if ok == 0 {
         return None;
     }
 
-    hardware_id_from_device_instance(&wide_to_string(&device.DeviceID))
+    let instance = wide_to_string(&device.DeviceID).to_ascii_uppercase();
+    // In clone mode a logical monitor can be shared by multiple physical screens.
+    device.cb = mem::size_of::<DISPLAY_DEVICEW>() as u32;
+    if require_unique
+        && unsafe { EnumDisplayDevicesW(monitor_info.szDevice.as_ptr(), 1, &mut device, 1) } != 0
+    {
+        return None;
+    }
+    (!instance.is_empty()).then_some(instance)
+}
+
+pub(crate) fn monitor_targets(displays: &[DisplayInfo]) -> Vec<(isize, DisplayId)> {
+    enumerate_logical_monitors()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|monitor| {
+            let path = monitor_device_path(monitor, true)?;
+            display_for_monitor(displays, &path).map(|id| (monitor as isize, id.clone()))
+        })
+        .collect()
+}
+
+fn display_for_monitor<'a>(displays: &'a [DisplayInfo], path: &str) -> Option<&'a DisplayId> {
+    let ddcci_prefix = format!("{ID_PREFIX}{path}:");
+    // A device interface path ends in a class GUID. WMI uses the PnP instance
+    // name for the same device, followed by a provider instance index.
+    let wmi_instance = path
+        .strip_prefix(r"\\?\")
+        .and_then(|path| path.rsplit_once("#{"))
+        .map(|(instance, _)| instance.replace('#', "\\"));
+    let mut matches = displays.iter().filter(|display| {
+        let id = display.id.as_str();
+        id.starts_with(&ddcci_prefix)
+            || wmi_instance.as_deref().is_some_and(|instance| {
+                id.strip_prefix(WMI_ID_PREFIX)
+                    .and_then(|id| id.rsplit_once('_'))
+                    .is_some_and(|(device, index)| {
+                        device == instance && index.parse::<u32>().is_ok()
+                    })
+            })
+    });
+    let display = matches.next()?;
+    (display.supported && matches.next().is_none()).then_some(&display.id)
 }
 
 fn find_monitor(display_id: &DisplayId) -> Result<PhysicalMonitor> {
-    let address = MonitorAddress::parse(display_id)?;
     enumerate_physical_monitors()?
         .into_iter()
-        .find(|monitor| monitor.address == address)
+        .find(|monitor| monitor.id() == *display_id)
         .ok_or_else(|| BrightnessError::DisplayNotFound(display_id.clone()))
 }
 
@@ -534,14 +569,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn monitor_address_round_trips_id() -> Result<()> {
-        let address = MonitorAddress {
-            logical_index: 2,
-            physical_index: 1,
+    fn monitor_id_survives_logical_display_reordering() {
+        let mut monitor = PhysicalMonitor {
+            address: MonitorAddress {
+                logical_index: 2,
+                physical_index: 0,
+            },
+            handle: ptr::null_mut(),
+            description: "Monitor".into(),
+            hardware_id: None,
+            device_instance: Some(r"\\?\DISPLAY#AOCB422#PORT1".into()),
         };
-
-        assert_eq!(MonitorAddress::parse(&address.id())?, address);
-        Ok(())
+        let id = monitor.id();
+        monitor.address.logical_index = 0;
+        assert_eq!(monitor.id(), id);
+        monitor.device_instance = Some(r"\\?\DISPLAY#AOCB422#PORT2".into());
+        assert_ne!(monitor.id(), id);
     }
 
     #[test]
@@ -552,7 +595,10 @@ mod tests {
 
         let displays = parse_wmi_list(output);
         assert_eq!(displays.len(), 2);
-        assert_eq!(displays[0].id.as_str(), "windows-wmi:0");
+        assert_eq!(
+            displays[0].id.as_str(),
+            r"windows-wmi:DISPLAY\SDC420B\4&1A2D752C&0&UID8388688_0"
+        );
         assert_eq!(displays[0].name, "Internal Display SDC420B");
         assert_eq!(displays[0].kind, DisplayKind::InternalBacklight);
         assert_eq!(displays[0].current, Some(60));
@@ -560,10 +606,53 @@ mod tests {
     }
 
     #[test]
-    fn parses_wmi_display_index() -> Result<()> {
-        assert_eq!(wmi_display_index(&DisplayId::new("windows-wmi:3"))?, 3);
-        assert!(wmi_display_index(&DisplayId::new("windows-ddcci:0:0")).is_err());
+    fn wmi_identity_survives_enumeration_reordering() -> Result<()> {
+        let original = parse_wmi_list(r"0|60|DISPLAY\SDC420B\port1");
+        let reordered = parse_wmi_list(r"1|60|DISPLAY\SDC420B\port1");
+        assert_eq!(original[0].id, reordered[0].id);
+        assert_eq!(
+            wmi_instance_name(&original[0].id)?,
+            r"DISPLAY\SDC420B\PORT1"
+        );
+        assert!(wmi_instance_name(&DisplayId::new("windows-wmi:3")).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn wheel_targets_match_device_instances_and_skip_ambiguous_or_unsupported_screens() {
+        let mut displays = parse_wmi_list("0|60|DISPLAY\\SAME123\\PORT1_0\n");
+        let external_path = r"\\?\DISPLAY#SAME123#PORT2#{E6F07B5F-EE97-4A90-B076-33F57BF4EAA7}";
+        let external_id = DisplayId::new(format!("{ID_PREFIX}{external_path}:0"));
+        displays.push(DisplayInfo {
+            id: external_id.clone(),
+            name: "External".into(),
+            kind: DisplayKind::ExternalDdcCi,
+            current: Some(70),
+            max: 100,
+            supported: true,
+        });
+
+        let internal_path = r"\\?\DISPLAY#SAME123#PORT1#{E6F07B5F-EE97-4A90-B076-33F57BF4EAA7}";
+        assert_eq!(
+            display_for_monitor(&displays, internal_path),
+            Some(&displays[0].id)
+        );
+        assert_eq!(
+            display_for_monitor(&displays, external_path),
+            Some(&external_id)
+        );
+        assert_eq!(
+            display_for_monitor(&displays, r"\\?\DISPLAY#SAME123#PORT3#{GUID}"),
+            None
+        );
+
+        displays[1].supported = false;
+        assert_eq!(display_for_monitor(&displays, external_path), None);
+        displays[1].supported = true;
+        let mut second = displays[1].clone();
+        second.id = DisplayId::new(format!("{ID_PREFIX}{external_path}:1"));
+        displays.push(second);
+        assert_eq!(display_for_monitor(&displays, external_path), None);
     }
 
     #[test]
@@ -589,6 +678,7 @@ mod tests {
             handle: std::ptr::null_mut(),
             description: "Generic PnP Monitor".to_string(),
             hardware_id: Some("SDC420B".to_string()),
+            device_instance: None,
         };
 
         assert!(monitor.matches_hardware_ids(&["SDC420B".to_string()]));

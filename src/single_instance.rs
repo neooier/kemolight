@@ -25,7 +25,9 @@ mod platform {
             }
 
             if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-                request_existing_instance_to_open();
+                if !crate::config::start_hidden_requested() {
+                    request_existing_instance_to_open();
+                }
                 unsafe {
                     CloseHandle(mutex);
                 }

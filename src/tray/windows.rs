@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    mem, ptr,
-    sync::mpsc::{self, Receiver},
-    thread,
-};
+use std::{collections::HashMap, mem, ptr, sync::mpsc, thread};
 
 use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -28,19 +23,21 @@ use windows_sys::Win32::{
 use crate::{
     app::{AppController, DisplayState},
     brightness::DisplayId,
+    profiles::ProfileSlot,
 };
 
 use super::TrayHandle;
 
 const TRAY_UID: u32 = 1;
 const WM_TRAY_CALLBACK: u32 = WM_APP + 1;
-const WM_TRAY_UPDATE: u32 = WM_APP + 2;
 const WM_TRAY_SHUTDOWN: u32 = WM_APP + 3;
 const WM_TRAY_OPEN_WINDOW: u32 = WM_APP + 4;
 
 const CMD_OPEN: u32 = 100;
 const CMD_REFRESH: u32 = 101;
 const CMD_QUIT: u32 = 102;
+const CMD_BRIGHT: u32 = 103;
+const CMD_DARK: u32 = 104;
 const CMD_DYNAMIC_START: u32 = 1000;
 const ICON_RESOURCE_VERSION: u32 = 0x0003_0000;
 const TRAY_ICON_SIZE: u16 = 32;
@@ -61,6 +58,7 @@ enum TrayCommand {
     Quit,
     Adjust(DisplayId, i32),
     Set(DisplayId, u32),
+    ApplyProfile(ProfileSlot),
 }
 
 pub fn start_tray(controller: AppController) -> TrayHandle {
@@ -77,23 +75,11 @@ pub fn start_tray(controller: AppController) -> TrayHandle {
         Ok(None) | Err(_) => return TrayHandle::unavailable(),
     };
 
-    let (update_tx, update_rx) = mpsc::channel();
-    spawn_update_forwarder(update_rx, hwnd);
-
-    TrayHandle::available(update_tx, move || unsafe {
+    // The native menu reads a fresh snapshot when opened. No update queue or
+    // forwarding thread is needed while the tray is idle.
+    TrayHandle::available(None, move || unsafe {
         PostMessageW(hwnd as HWND, WM_TRAY_SHUTDOWN, 0, 0);
     })
-}
-
-fn spawn_update_forwarder(update_rx: Receiver<()>, hwnd: isize) {
-    thread::spawn(move || {
-        while update_rx.recv().is_ok() {
-            let ok = unsafe { PostMessageW(hwnd as HWND, WM_TRAY_UPDATE, 0, 0) };
-            if ok == 0 {
-                break;
-            }
-        }
-    });
 }
 
 fn run_tray_thread(
@@ -239,7 +225,27 @@ impl WindowsTray {
         commands.insert(CMD_REFRESH, TrayCommand::Refresh);
         append_separator(menu.handle);
 
+        for (command_id, slot) in [
+            (CMD_BRIGHT, ProfileSlot::Bright),
+            (CMD_DARK, ProfileSlot::Dark),
+        ] {
+            append_command(
+                menu.handle,
+                command_id,
+                &format!("{} Profile\t{}", slot.label(), slot.shortcut()),
+                self.controller.can_apply_profile(slot),
+            );
+            commands.insert(command_id, TrayCommand::ApplyProfile(slot));
+        }
+        append_separator(menu.handle);
+
         let snapshot = self.controller.snapshot();
+        for error in [&snapshot.profile_error, &snapshot.hotkey_error]
+            .into_iter()
+            .flatten()
+        {
+            append_command(menu.handle, 0, error, false);
+        }
         if let Some(error) = snapshot.last_error {
             append_command(menu.handle, 0, &error, false);
             append_separator(menu.handle);
@@ -332,6 +338,7 @@ impl WindowsTray {
         match command {
             TrayCommand::Open => self.controller.request_open_window(),
             TrayCommand::Refresh => self.controller.refresh(),
+            TrayCommand::ApplyProfile(slot) => self.controller.apply_profile(slot),
             TrayCommand::Quit => self.controller.request_quit(),
             TrayCommand::Adjust(display_id, delta) => {
                 self.controller.adjust_brightness(display_id, delta)
@@ -391,7 +398,6 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
-        WM_TRAY_UPDATE => 0,
         WM_TRAY_OPEN_WINDOW => {
             (*tray).controller.request_open_window();
             0
@@ -497,7 +503,7 @@ fn best_ico_image(ico: &[u8], desired_size: u16) -> Option<&[u8]> {
     let mut best = None;
     let mut best_score = u16::MAX;
 
-    for entry in entries.chunks_exact(16) {
+    for entry in entries.as_chunks::<16>().0 {
         let width = if entry[0] == 0 { 256 } else { entry[0] as u16 };
         let height = if entry[1] == 0 { 256 } else { entry[1] as u16 };
         if width != height {
