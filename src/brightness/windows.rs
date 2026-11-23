@@ -391,6 +391,39 @@ impl PhysicalMonitorArray {
 
         Ok(array)
     }
+
+    fn take_monitors(
+        &mut self,
+        logical_index: usize,
+        device_instance: Option<String>,
+    ) -> impl Iterator<Item = PhysicalMonitor> + '_ {
+        // An interface path from GDI identifies a physical handle only when
+        // both enumerations identify exactly one monitor for this HMONITOR.
+        let device_instance = device_instance.filter(|_| self.monitors.len() == 1);
+        let hardware_id = device_instance.as_ref().and_then(|instance| {
+            hardware_id_from_device_instance(
+                &instance.trim_start_matches(r"\\?\").replace('#', "\\"),
+            )
+        });
+        self.monitors
+            .iter_mut()
+            .enumerate()
+            .map(move |(physical_index, monitor)| {
+                let description = monitor.szPhysicalMonitorDescription;
+                let handle = monitor.hPhysicalMonitor;
+                monitor.hPhysicalMonitor = ptr::null_mut();
+                PhysicalMonitor {
+                    address: MonitorAddress {
+                        logical_index,
+                        physical_index,
+                    },
+                    description: wide_to_string(&description),
+                    hardware_id: hardware_id.clone(),
+                    device_instance: device_instance.clone(),
+                    handle,
+                }
+            })
+    }
 }
 
 impl Drop for PhysicalMonitorArray {
@@ -422,30 +455,9 @@ fn enumerate_logical_monitors() -> Result<Vec<HMONITOR>> {
 fn enumerate_physical_monitors() -> Result<Vec<PhysicalMonitor>> {
     let mut monitors = Vec::new();
     for (logical_index, hmonitor) in enumerate_logical_monitors()?.into_iter().enumerate() {
-        let device_instance = monitor_device_instance(hmonitor);
-        let hardware_id = device_instance.as_ref().and_then(|instance| {
-            hardware_id_from_device_instance(
-                &instance.trim_start_matches(r"\\?\").replace('#', "\\"),
-            )
-        });
         let mut physical_monitors = PhysicalMonitorArray::from_hmonitor(hmonitor)?;
-        for (physical_index, physical_monitor) in physical_monitors.monitors.iter_mut().enumerate()
-        {
-            let description = physical_monitor.szPhysicalMonitorDescription;
-            let monitor = PhysicalMonitor {
-                address: MonitorAddress {
-                    logical_index,
-                    physical_index,
-                },
-                description: wide_to_string(&description),
-                hardware_id: hardware_id.clone(),
-                device_instance: device_instance.clone(),
-                handle: physical_monitor.hPhysicalMonitor,
-            };
-            // The individual monitor now owns this handle. The array still owns its buffer.
-            physical_monitor.hPhysicalMonitor = ptr::null_mut();
-            monitors.push(monitor);
-        }
+        monitors
+            .extend(physical_monitors.take_monitors(logical_index, monitor_device_path(hmonitor)));
     }
 
     Ok(monitors)
@@ -462,11 +474,7 @@ unsafe extern "system" fn enum_monitor(
     1
 }
 
-fn monitor_device_instance(hmonitor: HMONITOR) -> Option<String> {
-    monitor_device_path(hmonitor, false)
-}
-
-fn monitor_device_path(hmonitor: HMONITOR, require_unique: bool) -> Option<String> {
+fn monitor_device_path(hmonitor: HMONITOR) -> Option<String> {
     let mut monitor_info = MONITORINFOEXW::default();
     monitor_info.monitorInfo.cbSize = mem::size_of::<MONITORINFOEXW>() as u32;
 
@@ -489,9 +497,7 @@ fn monitor_device_path(hmonitor: HMONITOR, require_unique: bool) -> Option<Strin
     let instance = wide_to_string(&device.DeviceID).to_ascii_uppercase();
     // In clone mode a logical monitor can be shared by multiple physical screens.
     device.cb = mem::size_of::<DISPLAY_DEVICEW>() as u32;
-    if require_unique
-        && unsafe { EnumDisplayDevicesW(monitor_info.szDevice.as_ptr(), 1, &mut device, 1) } != 0
-    {
+    if unsafe { EnumDisplayDevicesW(monitor_info.szDevice.as_ptr(), 1, &mut device, 1) } != 0 {
         return None;
     }
     (!instance.is_empty()).then_some(instance)
@@ -502,7 +508,7 @@ pub(crate) fn monitor_targets(displays: &[DisplayInfo]) -> Vec<(isize, DisplayId
         .unwrap_or_default()
         .into_iter()
         .filter_map(|monitor| {
-            let path = monitor_device_path(monitor, true)?;
+            let path = monitor_device_path(monitor)?;
             display_for_monitor(displays, &path).map(|id| (monitor as isize, id.clone()))
         })
         .collect()
@@ -567,6 +573,30 @@ fn ddcci_error(context: &str) -> BrightnessError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_monitor_interface_is_not_used_to_persist_physical_monitors() {
+        let instance = r"\\?\DISPLAY#DEL1234#TEST#{GUID}".to_string();
+        let mut single = PhysicalMonitorArray {
+            monitors: vec![PHYSICAL_MONITOR::default()],
+        };
+        let mut mirrored = PhysicalMonitorArray {
+            monitors: vec![PHYSICAL_MONITOR::default(); 2],
+        };
+        let stable = single
+            .take_monitors(0, Some(instance.clone()))
+            .next()
+            .unwrap();
+        assert!(crate::profiles::persistent_id(&stable.id()));
+
+        let ids: Vec<_> = mirrored
+            .take_monitors(0, Some(instance))
+            .map(|monitor| monitor.id())
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        assert!(ids.iter().all(|id| !crate::profiles::persistent_id(id)));
+    }
 
     #[test]
     fn monitor_id_survives_logical_display_reordering() {

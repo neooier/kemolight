@@ -444,30 +444,50 @@ impl AppController {
     }
 
     pub fn adjust_brightness(&self, display_id: DisplayId, delta: i32) {
-        if let Some(current) = self.current_brightness(&display_id) {
-            self.set_brightness(
-                display_id,
-                apply_step(current, delta, self.inner.config.normalized_step()),
+        #[cfg(target_os = "windows")]
+        if let Some(remote) = &self.inner.remote {
+            remote.send(
+                self,
+                crate::ui_process::UiCommand::Adjust { display_id, delta },
             );
-        } else {
-            #[cfg(target_os = "windows")]
-            if let Some(remote) = &self.inner.remote {
-                remote.send(
-                    self,
-                    crate::ui_process::UiCommand::Adjust { display_id, delta },
-                );
-                return;
+            return;
+        }
+
+        let Ok(mut snapshot) = self.inner.snapshot.lock() else {
+            return;
+        };
+        let Some(display) = snapshot
+            .displays
+            .iter_mut()
+            .find(|display| display.info.id == display_id)
+        else {
+            return;
+        };
+        // Tray, window and wheel adjustments all accumulate against the owner's
+        // current preview. Serialize reading it and queuing the next value.
+        let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
+        display.pending = true;
+        display.error = None;
+        display.latest_request_id = request_id;
+        let command = if let Some(current) = display.info.current {
+            let value = apply_step(current, delta, self.inner.config.normalized_step());
+            display.info.current = Some(value);
+            BrightnessCommand::Set {
+                display_id,
+                value,
+                request_id,
             }
-            let request_id = self.inner.next_request_id.fetch_add(1, Ordering::Relaxed);
-            begin_brightness_update(&self.inner.snapshot, &display_id, request_id);
-            notify_state_changed(&self.inner.state_tx);
-            self.request_repaint();
-            let _ = self.inner.brightness_tx.send(BrightnessCommand::Adjust {
+        } else {
+            BrightnessCommand::Adjust {
                 display_id,
                 delta,
                 request_id,
-            });
-        }
+            }
+        };
+        let _ = self.inner.brightness_tx.send(command);
+        drop(snapshot);
+        notify_state_changed(&self.inner.state_tx);
+        self.request_repaint();
     }
 
     #[cfg(target_os = "windows")]
@@ -620,16 +640,6 @@ impl AppController {
             commands.push(command);
         }
         commands
-    }
-
-    fn current_brightness(&self, display_id: &DisplayId) -> Option<u32> {
-        self.inner.snapshot.lock().ok().and_then(|snapshot| {
-            snapshot
-                .displays
-                .iter()
-                .find(|display| &display.info.id == display_id)
-                .and_then(|display| display.info.current)
-        })
     }
 }
 
@@ -928,20 +938,23 @@ fn save_profile_snapshot(
     displays: &[DisplayInfo],
     path: Option<&std::path::Path>,
 ) {
-    let Ok(mut profiles) = snapshot.lock().map(|snapshot| snapshot.profiles.clone()) else {
-        return;
-    };
-    let count = profiles.capture(slot, displays);
-    let result = if count == 0 {
-        Err("No readable displays with a stable identity to save.".to_string())
-    } else if let Some(path) = path {
-        profiles.save(path)
+    let result = if let Some(path) = path {
+        BrightnessProfiles::capture_on_disk(path, slot, displays)
     } else {
-        Ok(())
+        let Ok(mut profiles) = snapshot.lock().map(|snapshot| snapshot.profiles.clone()) else {
+            return;
+        };
+        let count = profiles.capture(slot, displays);
+        Ok((profiles, count))
     };
     if let Ok(mut snapshot) = snapshot.lock() {
         match result {
-            Ok(()) => {
+            Ok((_, 0)) => {
+                snapshot.profile_message = None;
+                snapshot.profile_error =
+                    Some("No readable displays with a stable identity to save.".into());
+            }
+            Ok((profiles, count)) => {
                 snapshot.profiles = profiles;
                 snapshot.profile_message =
                     Some(format!("Saved {} for {count} display(s).", slot.label()));
@@ -1303,6 +1316,14 @@ mod tests {
             }
         }
 
+        fn wait_for(mut ready: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !ready() {
+                assert!(Instant::now() < deadline, "profile update timed out");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
         #[test]
         #[cfg(target_os = "windows")]
         fn wheel_adjusts_only_the_target_and_rejects_a_reused_monitor_handle() {
@@ -1407,13 +1428,6 @@ mod tests {
 
         #[test]
         fn saved_profiles_reload_and_apply_each_display_without_touching_hidden_panels() {
-            fn wait_for(mut ready: impl FnMut() -> bool) {
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while !ready() {
-                    assert!(Instant::now() < deadline, "profile update timed out");
-                    thread::sleep(Duration::from_millis(1));
-                }
-            }
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("profiles.toml");
             let backend = Arc::new(MockBrightnessBackend::default());
@@ -1467,6 +1481,34 @@ mod tests {
         }
 
         #[test]
+        fn two_controllers_saving_different_profiles_preserve_both_slots() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("profiles.toml");
+            let start = || {
+                let controller = AppController::with_backend_and_profiles_path(
+                    AppConfig::default(),
+                    Arc::new(MockBrightnessBackend::default()),
+                    Some(path.clone()),
+                );
+                wait_until_idle(&controller);
+                controller
+            };
+            let first = start();
+            let second = start();
+
+            first.save_profile(ProfileSlot::Bright);
+            second.save_profile(ProfileSlot::Dark);
+            wait_for(|| first.can_apply_profile(ProfileSlot::Bright));
+            wait_for(|| second.can_apply_profile(ProfileSlot::Dark));
+
+            let saved = BrightnessProfiles::load(&path).unwrap();
+            assert_eq!(saved.bright.len(), 2);
+            assert_eq!(saved.dark.len(), 2);
+            first.shutdown();
+            second.shutdown();
+        }
+
+        #[test]
         fn failed_profile_save_preserves_existing_profile_and_reports_error() {
             let backend = MockBrightnessBackend::default();
             let displays = backend.list_displays().unwrap();
@@ -1477,7 +1519,9 @@ mod tests {
             let mut changed = displays;
             changed[0].current = Some(10);
             let dir = tempfile::tempdir().unwrap();
-            save_profile_snapshot(&snapshot, ProfileSlot::Dark, &changed, Some(dir.path()));
+            let invalid_path = dir.path().join("profiles.toml");
+            std::fs::create_dir(&invalid_path).unwrap();
+            save_profile_snapshot(&snapshot, ProfileSlot::Dark, &changed, Some(&invalid_path));
             let snapshot = snapshot.lock().unwrap();
             assert!(snapshot.profile_error.is_some());
             assert!(snapshot.profile_message.is_none());

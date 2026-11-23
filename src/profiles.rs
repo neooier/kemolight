@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
 };
@@ -114,6 +114,34 @@ impl BrightnessProfiles {
             Ok(())
         };
         save().map_err(|err| format!("Cannot save brightness profiles: {err}"))
+    }
+
+    pub(crate) fn capture_on_disk(
+        path: &Path,
+        slot: ProfileSlot,
+        displays: &[DisplayInfo],
+    ) -> Result<(Self, usize), String> {
+        let lock = || -> io::Result<File> {
+            let lock_path = path.with_extension("lock");
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            // Lock a separate file because saving atomically replaces the TOML file.
+            let file = File::options()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(lock_path)?;
+            file.lock()?;
+            Ok(file)
+        };
+        let _lock = lock().map_err(|err| format!("Cannot lock brightness profiles: {err}"))?;
+        let mut profiles = Self::load(path)?;
+        let count = profiles.capture(slot, displays);
+        if count != 0 {
+            profiles.save(path)?;
+        }
+        Ok((profiles, count))
     }
 }
 

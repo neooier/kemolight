@@ -7,7 +7,10 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     os::windows::process::CommandExt,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+        Arc, Mutex,
+    },
     thread::{self, JoinHandle},
 };
 
@@ -203,21 +206,48 @@ impl RemoteClient {
 
 struct ParentConnection {
     id: u64,
-    writer: Box<dyn Write + Send>,
+    writer_wakeup: SyncSender<()>,
+    window_visible: Option<bool>,
     acknowledged: u64,
     closing: bool,
     reopen_requested: bool,
 }
 
 impl ParentConnection {
-    fn send_state(&mut self, controller: &AppController) -> io::Result<()> {
-        write_message(
-            &mut self.writer,
-            &ParentMessage::State(Box::new(UiState {
-                snapshot: controller.snapshot(),
-                acknowledged: self.acknowledged,
-            })),
-        )
+    fn new(id: u64) -> (Self, Receiver<()>) {
+        let (writer_wakeup, wakeups) = mpsc::sync_channel(1);
+        let connection = Self {
+            id,
+            writer_wakeup,
+            window_visible: None,
+            acknowledged: 0,
+            closing: false,
+            reopen_requested: false,
+        };
+        (connection, wakeups)
+    }
+
+    fn wake_writer(&self) -> io::Result<()> {
+        match self.writer_wakeup.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => Ok(()),
+            Err(TrySendError::Disconnected(())) => Err(io::ErrorKind::BrokenPipe.into()),
+        }
+    }
+
+    fn set_window_visible(&mut self, visible: bool) -> io::Result<()> {
+        if self.closing {
+            self.reopen_requested = visible;
+            return Ok(());
+        }
+        self.window_visible = Some(visible);
+        self.wake_writer()
+    }
+
+    fn state_message(&self, controller: &AppController) -> ParentMessage {
+        ParentMessage::State(Box::new(UiState {
+            snapshot: controller.snapshot(),
+            acknowledged: self.acknowledged,
+        }))
     }
 
     fn apply(&mut self, controller: &AppController, request: UiRequest) -> io::Result<()> {
@@ -242,19 +272,55 @@ impl ParentConnection {
             }
             UiCommand::Quit => controller.request_quit(),
         }
-        // The connection lock covers command application, acknowledgment, and
-        // snapshot capture, including state updates from the hardware worker.
+        // The writer captures the acknowledgment and snapshot together under
+        // the same lock as command application.
         self.acknowledged = request.sequence;
-        self.send_state(controller)
+        self.wake_writer()
     }
 }
 
 type SharedConnection = Arc<Mutex<Option<ParentConnection>>>;
 
+fn write_pending_messages(
+    writer: &mut impl Write,
+    wakeups: Receiver<()>,
+    controller: &AppController,
+    connection: &SharedConnection,
+    id: u64,
+) -> io::Result<()> {
+    while wakeups.recv().is_ok() {
+        let (state, visibility) = {
+            let mut connection = connection
+                .lock()
+                .map_err(|_| io::Error::other("UI connection lock poisoned"))?;
+            let Some(current) = connection.as_mut().filter(|current| current.id == id) else {
+                break;
+            };
+            (
+                current.state_message(controller),
+                current.window_visible.take(),
+            )
+        };
+        // Only the writer thread touches the pipe. The tray can still close
+        // and terminate this child if the pipe is full or the child hangs.
+        write_message(writer, &state)?;
+        if let Some(visible) = visibility {
+            let command = if visible {
+                ParentMessage::Open
+            } else {
+                ParentMessage::Hide
+            };
+            write_message(writer, &command)?;
+        }
+    }
+    Ok(())
+}
+
 struct UiChild {
     id: u64,
     process: Child,
     reader: Option<JoinHandle<()>>,
+    writer: Option<JoinHandle<()>>,
     connection: SharedConnection,
 }
 
@@ -275,6 +341,7 @@ impl UiChild {
             id,
             process,
             reader: None,
+            writer: None,
             connection: Arc::clone(connection),
         };
         let mut writer = child
@@ -287,35 +354,40 @@ impl UiChild {
             .stdout
             .take()
             .ok_or_else(|| invalid_message("missing UI output pipe"))?;
-        write_message(
-            &mut writer,
-            &ParentMessage::Initialize(Box::new(InitialState {
-                config: controller.config().clone(),
-                snapshot: controller.snapshot(),
-                geometry: controller.window_geometry(),
-                tray_available: controller.tray_available(),
-            })),
-        )?;
+        let initial = ParentMessage::Initialize(Box::new(InitialState {
+            config: controller.config().clone(),
+            snapshot: controller.snapshot(),
+            geometry: controller.window_geometry(),
+            tray_available: controller.tray_available(),
+        }));
+        let (current, wakeups) = ParentConnection::new(id);
+        // Discovery may finish between capturing Initialize and publishing
+        // this connection. Send the current snapshot after initialization too.
+        current.wake_writer()?;
         *connection
             .lock()
-            .map_err(|_| io::Error::other("UI connection lock poisoned"))? =
-            Some(ParentConnection {
-                id,
-                writer: Box::new(writer),
-                acknowledged: 0,
-                closing: false,
-                reopen_requested: false,
-            });
+            .map_err(|_| io::Error::other("UI connection lock poisoned"))? = Some(current);
 
-        // Discovery may complete between capturing Initialize and installing
-        // the connection, after its wakeup was consumed without a UI attached.
-        if let Some(current) = connection
-            .lock()
-            .map_err(|_| io::Error::other("UI connection lock poisoned"))?
-            .as_mut()
-        {
-            current.send_state(controller)?;
-        }
+        let writer_controller = controller.clone();
+        let writer_connection = Arc::clone(connection);
+        child.writer = Some(
+            thread::Builder::new()
+                .name("ui-writer".into())
+                .spawn(move || {
+                    let result = write_message(&mut writer, &initial).and_then(|()| {
+                        write_pending_messages(
+                            &mut writer,
+                            wakeups,
+                            &writer_controller,
+                            &writer_connection,
+                            id,
+                        )
+                    });
+                    if result.is_err() {
+                        writer_controller.ui_closed(id);
+                    }
+                })?,
+        );
 
         let reader_controller = controller.clone();
         let reader_connection = Arc::clone(connection);
@@ -367,6 +439,9 @@ impl Drop for UiChild {
             let _ = self.process.kill();
         }
         let _ = self.process.wait();
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
@@ -388,11 +463,7 @@ fn session_loop(controller: &AppController, connection: &SharedConnection) -> io
                         .lock()
                         .map_err(|_| io::Error::other("UI connection lock poisoned"))?;
                     if let Some(current) = current.as_mut() {
-                        if current.closing {
-                            current.reopen_requested = true;
-                            continue;
-                        }
-                        if write_message(&mut current.writer, &ParentMessage::Open).is_ok() {
+                        if current.set_window_visible(true).is_ok() {
                             continue;
                         }
                     }
@@ -404,7 +475,7 @@ fn session_loop(controller: &AppController, connection: &SharedConnection) -> io
             Some(AppCommand::HideWindow) => {
                 if let Ok(mut current) = connection.lock() {
                     if let Some(current) = current.as_mut() {
-                        let _ = write_message(&mut current.writer, &ParentMessage::Hide);
+                        let _ = current.set_window_visible(false);
                     }
                 }
             }
@@ -443,7 +514,7 @@ pub(crate) fn run_sessions(controller: &AppController) -> io::Result<()> {
                 }
                 if let Ok(mut current) = updates_connection.lock() {
                     if let Some(current) = current.as_mut().filter(|current| !current.closing) {
-                        if current.send_state(&updates_controller).is_err() {
+                        if current.wake_writer().is_err() {
                             updates_controller.ui_closed(current.id);
                         }
                     }
@@ -533,16 +604,6 @@ mod tests {
         }
     }
 
-    fn connection(writer: impl Write + Send + 'static) -> ParentConnection {
-        ParentConnection {
-            id: 1,
-            writer: Box::new(writer),
-            acknowledged: 0,
-            closing: false,
-            reopen_requested: false,
-        }
-    }
-
     #[test]
     fn protocol_preserves_message_boundaries_and_unicode() {
         let snapshot = AppSnapshot {
@@ -595,7 +656,7 @@ mod tests {
             AppConfig::default(),
             Arc::new(UnsupportedBackend::new("test")),
         );
-        let mut connection = connection(io::sink());
+        let (mut connection, _wakeups) = ParentConnection::new(1);
         connection
             .apply(
                 &controller,
@@ -676,16 +737,11 @@ mod tests {
         child.set_brightness(id.clone(), 10);
         child.set_brightness(id.clone(), 80);
         let mut requests = Cursor::new(requests.0.lock().unwrap().clone());
-        let updates = SharedBytes::default();
-        let mut connection = connection(updates.clone());
+        let (mut connection, _wakeups) = ParentConnection::new(1);
         connection
             .apply(&parent, read_message(&mut requests).unwrap().unwrap())
             .unwrap();
-        let ParentMessage::State(update) =
-            read_message(&mut Cursor::new(updates.0.lock().unwrap().clone()))
-                .unwrap()
-                .unwrap()
-        else {
+        let ParentMessage::State(update) = connection.state_message(&parent) else {
             panic!("missing update")
         };
         remote.receive(&child, *update);
@@ -742,25 +798,97 @@ mod tests {
 
     #[cfg(feature = "mock-backend")]
     #[test]
+    fn remote_adjustment_accumulates_with_a_newer_owner_adjustment() {
+        let (parent, _) = mock_controller();
+        let requests = SharedBytes::default();
+        let child = AppController::with_remote(
+            AppConfig::default(),
+            parent.snapshot(),
+            WindowGeometry::default(),
+            true,
+            RemoteClient::new(requests.clone()),
+        );
+        let id = DisplayId::new("mock:internal");
+        parent.adjust_brightness(id.clone(), 1);
+        child.adjust_brightness(id.clone(), 1);
+
+        let (mut connection, _wakeups) = ParentConnection::new(1);
+        let mut requests = Cursor::new(requests.0.lock().unwrap().clone());
+        connection
+            .apply(&parent, read_message(&mut requests).unwrap().unwrap())
+            .unwrap();
+        let display = parent
+            .snapshot()
+            .displays
+            .into_iter()
+            .find(|display| display.info.id == id);
+        assert_eq!(display.unwrap().info.current, Some(70));
+        parent.shutdown();
+    }
+
+    #[cfg(feature = "mock-backend")]
+    struct BlockingWriter {
+        started: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+        blocked: bool,
+    }
+
+    #[cfg(feature = "mock-backend")]
+    impl Write for BlockingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if !self.blocked {
+                self.blocked = true;
+                self.started.send(()).unwrap();
+                self.resume.recv_timeout(Duration::from_secs(3)).unwrap();
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "mock-backend")]
+    #[test]
+    fn blocked_parent_pipe_leaves_session_available_for_shutdown() {
+        let (parent, _) = mock_controller();
+        let (current, wakeups) = ParentConnection::new(1);
+        current.wake_writer().unwrap();
+        let connection = Arc::new(Mutex::new(Some(current)));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let mut pipe = BlockingWriter {
+            started: started_tx,
+            resume: resume_rx,
+            blocked: false,
+        };
+        let writer_connection = Arc::clone(&connection);
+        let writer_parent = parent.clone();
+        let writer = thread::spawn(move || {
+            write_pending_messages(&mut pipe, wakeups, &writer_parent, &writer_connection, 1)
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        {
+            let mut connection = connection
+                .try_lock()
+                .expect("pipe writer holds the session lock");
+            let current = connection.as_mut().unwrap();
+            current.set_window_visible(true).unwrap();
+            current.set_window_visible(false).unwrap();
+            assert_eq!(current.window_visible, Some(false));
+            *connection = None;
+        }
+        resume_tx.send(()).unwrap();
+        writer.join().unwrap();
+        parent.shutdown();
+    }
+
+    #[cfg(feature = "mock-backend")]
+    #[test]
     fn blocked_outgoing_pipe_does_not_block_incoming_snapshots() {
-        struct BlockingWriter {
-            started: mpsc::Sender<()>,
-            resume: mpsc::Receiver<()>,
-            blocked: bool,
-        }
-        impl Write for BlockingWriter {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                if !self.blocked {
-                    self.blocked = true;
-                    self.started.send(()).unwrap();
-                    self.resume.recv_timeout(Duration::from_secs(3)).unwrap();
-                }
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
         let (parent, _) = mock_controller();
         let (started_tx, started_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
