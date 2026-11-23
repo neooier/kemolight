@@ -1538,6 +1538,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "eframe",
+ "image",
  "ksni",
  "serde",
  "serde_json",

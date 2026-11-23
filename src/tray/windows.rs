@@ -559,7 +559,9 @@ mod tests {
     }
 
     #[test]
-    fn embedded_logo_ico_has_icon_image() {
-        assert!(best_ico_image(LOGO_ICO, TRAY_ICON_SIZE).is_some());
+    fn windows_loads_embedded_tray_icon() {
+        let (icon, owned) = load_tray_icon();
+        assert!(owned && !icon.is_null());
+        unsafe { DestroyIcon(icon) };
     }
 }

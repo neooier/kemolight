@@ -1,5 +1,6 @@
 #[cfg(target_os = "windows")]
 fn main() {
+    println!("cargo:rerun-if-changed=assets/logo.ico");
     let mut resource = winresource::WindowsResource::new();
     resource.set_icon("assets/logo.ico");
     resource.set("FileDescription", "KemoLight");

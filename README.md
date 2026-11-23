@@ -1,7 +1,7 @@
 # KemoLight
 
 <p align="center">
-  <img src="assets/logo.svg" alt="KemoLight logo" width="96">
+  <img src="assets/logo.png" alt="KemoLight logo" width="96">
 </p>
 
 KemoLight is a lightweight egui brightness controller. It supports Linux desktops and Windows external monitors that expose brightness control through DDC/CI.
